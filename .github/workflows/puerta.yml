@@ -1,0 +1,77 @@
+# Puerta comun del ecosistema (2026-09-27). Es la comprobacion OBLIGATORIA del ruleset
+# de `main`: si pasa, `gh pr merge --auto` fusiona sola; si falla, no entra nada.
+# No sustituye a la puerta propia del repo: la ejecuta si existe.
+name: puerta
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: puerta-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  puerta:
+    name: puerta
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Solo lo que trae el cambio: el historial viejo no bloquea cada PR, pero nada
+      # nuevo entra con un secreto.
+      - name: Secretos en el cambio (gitleaks)
+        run: |
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            rango="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            rango="${{ github.event.before }}..${{ github.sha }}"
+            git cat-file -e "${{ github.event.before }}" 2>/dev/null || rango="${{ github.sha }}~1..${{ github.sha }}"
+          fi
+          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.21.2 \
+            git --no-banner --redact --log-opts="$rango" .
+
+      # `.puerta-ignorar` (una ruta o patron glob por linea, `#` para el motivo): ficheros
+      # que NO se leen como su extension dice. Cada entrada debe llevar su porque.
+      - name: Sintaxis
+        run: |
+          pip install -q pyyaml >/dev/null 2>&1
+          python3 - <<'PY'
+          import fnmatch, json, pathlib, py_compile, subprocess, sys, yaml
+          fuera = ("node_modules", ".venv", "venv", ".git", "archivo", "dist", "build")
+          ign = []
+          if pathlib.Path(".puerta-ignorar").exists():
+              ign = [l.split("#")[0].strip() for l in open(".puerta-ignorar")]
+              ign = [x for x in ign if x]
+          fallos = 0
+          def mal(f, msg):
+              global fallos; fallos = 1
+              print(f"::error file={f}::{msg}")
+          for p in pathlib.Path(".").rglob("*"):
+              if not p.is_file() or any(x in p.parts for x in fuera): continue
+              f = str(p)
+              if any(fnmatch.fnmatch(f, g) for g in ign): continue
+              try:
+                  if p.suffix == ".py":
+                      py_compile.compile(f, doraise=True)
+                  elif p.suffix == ".sh":
+                      r = subprocess.run(["bash", "-n", f], capture_output=True, text=True)
+                      if r.returncode: mal(f, "bash -n: " + r.stderr.strip().splitlines()[-1])
+                  elif p.suffix == ".json" and not p.name.startswith("tsconfig"):
+                      json.load(open(f))
+                  elif p.suffix in (".yml", ".yaml"):
+                      list(yaml.safe_load_all(open(f)))
+              except Exception as e:
+                  mal(f, str(e).splitlines()[0][:200])
+          sys.exit(fallos)
+          PY
+
+      - name: Puerta propia del repo
+        run: |
+          for g in scripts/puerta.sh scripts/ci/gate.sh verify.sh gate.sh; do
+            if [ -f "$g" ]; then echo "== $g"; exec bash "$g"; fi
+          done
+          echo "Sin puerta propia: cuentan secretos + sintaxis."
