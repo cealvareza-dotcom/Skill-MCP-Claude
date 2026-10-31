@@ -1,0 +1,76 @@
+# Puerta de Forgejo (genérica) — runner core1 de core-01, modo host.
+# La protección de `main` en Forgejo exige `puerta / *` en verde para fusionar.
+# Fuente única: helpydoc-infrastructure/stacks/core-01/forgejo-ci/puerta-generica.yml
+name: puerta
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  generica:
+    runs-on: core1
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        run: |
+          git clone --quiet --depth 1 --branch "${{ github.head_ref }}" \
+            "http://x-access-token:${{ github.token }}@helpydoc-forgejo:3000/${{ github.repository }}.git" repo
+      - name: Puerta
+        working-directory: repo
+        run: |
+          #!/usr/bin/env bash
+          # Puerta genérica de Forgejo: detecta la pila del repo y corre lo que tiene. No inventa pruebas:
+          # si el repo no tiene tests, la puerta solo garantiza higiene (sintaxis, JSON, YAML) y lo dice.
+          set -u
+          set +e   # el runner de Forgejo lanza los pasos con `bash -e`: aquí se cuentan los fallos a mano
+          fallos=0; hechos=()
+          fallo() { echo "::error::$*"; fallos=$((fallos+1)); }
+          paso()  { echo "── $*"; }
+
+          # 1 · Python
+          reqs=$(git ls-files 'requirements*.txt' ':!:**/node_modules/**' | head -5)
+          if [ -n "$reqs" ] || [ -f pyproject.toml ]; then
+            paso "Python: entorno"
+            python3 -m venv .venv-puerta && . .venv-puerta/bin/activate && pip install -q --upgrade pip 2>&1 | tail -1
+            for r in $reqs; do pip install -q -r "$r" 2>&1 | tail -2 || true; done
+            if [ -f pyproject.toml ]; then
+              pip install -q -e ".[dev]" 2>&1 | tail -2 || pip install -q -e . 2>&1 | tail -2 || true
+            fi
+            pip install -q pytest 2>&1 | tail -1
+            if [ -d tests ] || [ -f pytest.ini ] || grep -qs '\[tool.pytest' pyproject.toml; then
+              paso "Python: pytest"; hechos+=(pytest)
+              pytest -q -x -p no:cacheprovider || fallo "pytest falla"
+            fi
+            deactivate 2>/dev/null || true
+          fi
+
+          # 2 · Node (cada package.json fuera de node_modules)
+          excl=$(cat .forgejo/puerta-excluir-node 2>/dev/null || true)   # un directorio por línea: pruebas que necesitan entorno externo
+          for pj in $(git ls-files '*package.json'); do
+            d=$(dirname "$pj"); echo "$excl" | grep -qx "$d" && { echo "── Node: $d (excluido por .forgejo/puerta-excluir-node)"; continue; }
+            paso "Node: $d"
+            ( cd "$d" || exit 1
+              if [ -f package-lock.json ]; then npm ci --no-audit --no-fund || exit 1; else npm install --no-audit --no-fund || exit 1; fi
+              npm test --if-present || exit 1
+              npm run build --if-present || exit 1 ) && hechos+=("node:$d") || fallo "node falla en $d"
+          done
+
+          # 3 · Go
+          if [ -f go.mod ]; then
+            paso "Go"; hechos+=(go)
+            [ -z "$(gofmt -l .)" ] || fallo "gofmt"; go vet ./... || fallo "go vet"; go test ./... || fallo "go test"
+          fi
+
+          # 4 · Higiene (siempre)
+          paso "Higiene"
+          # Los ficheros «._*» son metadatos de macOS (AppleDouble) que se colaron en git: no son código, se avisan y se saltan.
+          ad=$(git ls-files | grep -c '/\._\|^\._' || true); [ "$ad" -gt 0 ] && echo "AVISO: $ad ficheros ._* de macOS versionados (conviene retirarlos); se ignoran en la higiene."
+          for f in $(git ls-files '*.sh' ':!:**/._*'); do bash -n "$f" 2>&1 || fallo "sintaxis shell: $f"; done
+          for f in $(git ls-files '*.json' ':!:**/package-lock.json' ':!:**/._*'); do python3 -c 'import json,sys;json.load(open(sys.argv[1]))' "$f" 2>/dev/null || fallo "JSON inválido: $f"; done
+          for f in $(git ls-files '*.py' ':!:**/._*'); do python3 -m py_compile "$f" 2>&1 || fallo "sintaxis python: $f"; done
+          rm -rf __pycache__ 2>/dev/null
+
+          if [ ${#hechos[@]} -eq 0 ]; then echo "AVISO: el repo no tiene pruebas automáticas; esta puerta solo valida higiene."; fi
+          echo "puerta genérica: comprobaciones=${hechos[*]:-solo-higiene} fallos=$fallos"
+          [ "$fallos" -eq 0 ]
