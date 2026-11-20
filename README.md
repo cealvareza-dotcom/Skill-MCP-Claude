@@ -1,3 +1,5 @@
+> ⚠️ **Repositorio sustituido (20-nov-2026).** La versión única es [`skill-mcp-claude-local`](https://github.com/cealvareza-dotcom/skill-mcp-claude-local), que contiene todos los ficheros de este repo (salvo `SkillsManager.spec`, que genera PyInstaller) y su historia posterior. Este repo queda para archivar en modo solo lectura; no abras PR aquí.
+
 # Skills Manager
 
 A visual web interface for managing Claude MCP Skills with Claude Code CLI integration.
